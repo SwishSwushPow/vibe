@@ -139,6 +139,8 @@ Options
 
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
+  --update-base-image                                       Reprovision the base image if it is outdated (new Debian version or provision script).
+  --reset-instance                                          Reset this project's instance disk to the current base image (discards all VM state for this project).
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
@@ -196,6 +198,26 @@ Options
     let mise_directory_share =
         DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
 
+    if args.update_base_image {
+        let fingerprint_path = default_raw.with_extension("fingerprint");
+        let stored = fs::read_to_string(&fingerprint_path).unwrap_or_default();
+        if default_raw.exists() && stored.trim() == image_fingerprint() {
+            println!("Base image is already up to date.");
+        } else {
+            ensure_default_image(
+                &base_raw,
+                &base_compressed,
+                &default_raw,
+                std::slice::from_ref(&mise_directory_share),
+                prepare_network_backend,
+            )?;
+            println!("Base image updated.");
+        }
+        return Ok(());
+    }
+
+    let mut instance_notice: Option<String> = None;
+
     let disk_path = if let Some(path) = args.disk {
         if !path.exists() {
             return Err(format!("Disk image does not exist: {}", path.display()).into());
@@ -209,8 +231,7 @@ Options
             std::slice::from_ref(&mise_directory_share),
             prepare_network_backend,
         )?;
-        ensure_instance_disk(&instance_raw, &default_raw)?;
-
+        instance_notice = ensure_instance_disk(&instance_raw, &default_raw, args.reset_instance)?;
         instance_raw
     };
 
@@ -283,7 +304,11 @@ Options
     // Enable bash history
     login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
 
-    if let Some(motd_action) = motd_login_action(&directory_shares) {
+    if let Some(ref notice) = instance_notice {
+        println!("{notice}");
+    }
+
+    if let Some(motd_action) = motd_login_action(&directory_shares, instance_notice.as_deref()) {
         login_actions.push(motd_action);
     }
 
@@ -304,6 +329,8 @@ struct CliArgs {
     disk: Option<PathBuf>,
     version: bool,
     help: bool,
+    update_base_image: bool,
+    reset_instance: bool,
     no_default_mounts: bool,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
@@ -323,6 +350,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut disk = None;
     let mut version = false;
     let mut help = false;
+    let mut update_base_image = false;
+    let mut reset_instance = false;
     let mut no_default_mounts = false;
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
@@ -335,6 +364,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         match arg {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
+            Long("update-base-image") => update_base_image = true,
+            Long("reset-instance") => reset_instance = true,
             Long("no-default-mounts") => no_default_mounts = true,
             Long("cpus") => {
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
@@ -389,6 +420,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         disk,
         version,
         help,
+        update_base_image,
+        reset_instance,
         no_default_mounts,
         mounts,
         login_actions,
@@ -426,8 +459,11 @@ fn script_command_from_content(
     Ok(command)
 }
 
-fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
-    if directory_shares.is_empty() {
+fn motd_login_action(
+    directory_shares: &[DirectoryShare],
+    notice: Option<&str>,
+) -> Option<LoginAction> {
+    if directory_shares.is_empty() && notice.is_none() {
         return Some(Send(" clear".into()));
     }
 
@@ -485,6 +521,12 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
         output.push_str(&format!(
             "{host:<host_width$}  {guest:<guest_width$}  {mode}\n"
         ));
+    }
+
+    if let Some(notice) = notice {
+        output.push('\n');
+        output.push_str(notice);
+        output.push('\n');
     }
 
     let command = format!(" clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
@@ -607,6 +649,14 @@ fn ensure_base_image(
     Ok(())
 }
 
+fn image_fingerprint() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    DEBIAN_COMPRESSED_DISK_URL.hash(&mut hasher);
+    PROVISION_SCRIPT.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 fn ensure_default_image(
     base_raw: &Path,
     base_compressed: &Path,
@@ -614,8 +664,16 @@ fn ensure_default_image(
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let fingerprint_path = default_raw.with_extension("fingerprint");
+    let current_fingerprint = image_fingerprint();
+
     if default_raw.exists() {
-        return Ok(());
+        let stored = fs::read_to_string(&fingerprint_path).unwrap_or_default();
+        if stored.trim() == current_fingerprint {
+            return Ok(());
+        }
+        println!("Reprovisioning base image...");
+        fs::remove_file(default_raw)?;
     }
 
     ensure_base_image(base_raw, base_compressed)?;
@@ -639,21 +697,78 @@ fn ensure_default_image(
         DEFAULT_RAM_BYTES,
     )?;
 
+    fs::write(&fingerprint_path, &current_fingerprint)?;
+    cleanup_old_debian_files(base_compressed, base_raw);
+
     Ok(())
+}
+
+fn cleanup_old_debian_files(current_compressed: &Path, current_raw: &Path) {
+    let cache_dir = match current_compressed.parent() {
+        Some(dir) => dir,
+        None => return,
+    };
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        let is_stale = (name.starts_with("debian-")
+            && name.ends_with(".tar.xz")
+            && path != current_compressed)
+            || (name.starts_with("debian-") && name.ends_with(".raw") && path != current_raw);
+        if is_stale {
+            println!("Removing old Debian image: {}", path.display());
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("Warning: failed to remove {}: {e}", path.display());
+            }
+        }
+    }
 }
 
 fn ensure_instance_disk(
     instance_raw: &Path,
     template_raw: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+    reset: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let fingerprint_path = instance_raw.with_extension("fingerprint");
+    let current_fingerprint = image_fingerprint();
+
     if instance_raw.exists() {
-        return Ok(());
+        let stored = fs::read_to_string(&fingerprint_path).unwrap_or_default();
+        if stored.trim() == current_fingerprint {
+            return Ok(None);
+        }
+        if !reset {
+            let base_outdated = {
+                let base_fingerprint_path = template_raw.with_extension("fingerprint");
+                let stored_base = fs::read_to_string(&base_fingerprint_path).unwrap_or_default();
+                stored_base.trim() != current_fingerprint
+            };
+            let notice = if base_outdated {
+                "Note: this project's instance disk is based on an outdated image. \
+                Run `vibe --update-base-image` to update the base image, \
+                then `vibe --reset-instance` to apply it to this project (discards VM state for this project)."
+            } else {
+                "Note: this project's instance disk is based on an outdated image. \
+                Run `vibe --reset-instance` to reset it (discards VM state for this project)."
+            };
+            return Ok(Some(notice.to_string()));
+        }
+        println!("Resetting instance disk...");
+        fs::remove_file(instance_raw)?;
     }
 
-    println!("Creating instance disk from {}...", template_raw.display());
+    println!("Creating instance disk...");
     std::fs::create_dir_all(instance_raw.parent().unwrap())?;
     fs::copy(template_raw, instance_raw)?;
-    Ok(())
+    fs::write(&fingerprint_path, &current_fingerprint)?;
+    Ok(None)
 }
 
 pub struct IoContext {
