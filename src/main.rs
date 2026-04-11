@@ -39,6 +39,7 @@ const BYTES_PER_MB: u64 = 1024 * 1024;
 const DEFAULT_CPU_COUNT: usize = 2;
 const DEFAULT_RAM_MB: u64 = 2048;
 const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
+const PROVISION_RAM_BYTES: u64 = 4096 * BYTES_PER_MB;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -694,7 +695,7 @@ fn ensure_default_image(
         directory_shares,
         prepare_network_backend,
         DEFAULT_CPU_COUNT,
-        DEFAULT_RAM_BYTES,
+        PROVISION_RAM_BYTES,
     )?;
 
     fs::write(&fingerprint_path, &current_fingerprint)?;

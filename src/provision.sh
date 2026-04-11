@@ -74,12 +74,14 @@ cat > .config/mise/config.toml <<MISE
     uv = "0.9.25"
     node = "24.13.0"
     "npm:@openai/codex" = "latest"
-    "npm:@anthropic-ai/claude-code" = "latest"
     "npm:@google/gemini-cli" = "latest"
 MISE
 
 touch .config/mise/mise.lock
 mise install
+
+# Install Claude Code via native installer (faster, no Node.js dependency, auto-updates)
+curl -fsSL https://claude.ai/install.sh | bash
 
 # Done provisioning, power off the VM
 systemctl poweroff
