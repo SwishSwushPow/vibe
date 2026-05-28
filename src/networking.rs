@@ -87,7 +87,7 @@ impl NetworkMode {
                 };
 
                 if let NetworkMode::VmnetBridged { shared_interface } = self {
-                    let output = Command::new(&vmnet_helper_path)
+                    let output = Command::new(vmnet_helper_path)
                         .arg("--list-shared-interfaces")
                         .output()?;
 

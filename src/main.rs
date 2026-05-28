@@ -882,6 +882,7 @@ impl IoContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_vm_configuration(
     disk_path: &Path,
     directory_shares: &[DirectoryShare],
