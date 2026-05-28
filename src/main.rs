@@ -381,7 +381,8 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
             // Any user-provided login actions must come after our system ones
             login_actions.extend(args.login_actions);
 
-            let translator = DragTranslator::new(&directory_shares, Some(drops), args.drag_translate);
+            let translator =
+                DragTranslator::new(&directory_shares, Some(drops), args.drag_translate);
 
             run_vm(
                 &disk_path,
@@ -821,10 +822,6 @@ impl OutputMonitor {
             .unwrap();
 
         line
-    }
-
-    fn snapshot(&self) -> String {
-        self.buffer.lock().unwrap().clone()
     }
 }
 

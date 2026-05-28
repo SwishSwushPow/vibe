@@ -52,7 +52,7 @@ impl DropsStaging {
         Ok(guest)
     }
 
-    pub fn as_share(&self) -> DirectoryShare {
+    pub(crate) fn as_share(&self) -> DirectoryShare {
         DirectoryShare {
             host: self.host_root.clone(),
             guest: self.guest_root.clone(),
@@ -125,7 +125,11 @@ pub struct DragTranslator {
 }
 
 impl DragTranslator {
-    pub fn new(shares: &[DirectoryShare], drops: Option<DropsStaging>, enabled: bool) -> Self {
+    pub(crate) fn new(
+        shares: &[DirectoryShare],
+        drops: Option<DropsStaging>,
+        enabled: bool,
+    ) -> Self {
         let mut mappings: Vec<ShareMapping> = shares
             .iter()
             .filter_map(|s| {
@@ -357,13 +361,10 @@ impl DragTranslator {
         }
         let old = std::mem::replace(&mut self.state, PasteState::Pass);
         match old {
-            PasteState::InPaste { buf, overflow, .. } => {
-                if !overflow {
-                    // Emit start marker + buffered content without a closing marker.
-                    out.extend_from_slice(PASTE_START);
-                    out.extend_from_slice(&buf);
-                }
-                // If overflow, content was already emitted byte-by-byte.
+            PasteState::InPaste { buf, overflow, .. } if !overflow => {
+                // Emit start marker + buffered content without a closing marker.
+                out.extend_from_slice(PASTE_START);
+                out.extend_from_slice(&buf);
             }
             PasteState::MatchingEnd {
                 buf, overflow, idx, ..
@@ -418,14 +419,12 @@ impl DragTranslator {
         }
 
         // Not under any share — auto-stage if it's a regular file.
-        if let Ok(meta) = host_path.metadata() {
-            if meta.is_file() {
-                if let Some(drops) = &self.drops {
-                    if let Ok(guest_path) = drops.stage(&host_path) {
-                        return guest_path.as_os_str().as_bytes().to_vec();
-                    }
-                }
-            }
+        if let Ok(meta) = host_path.metadata()
+            && meta.is_file()
+            && let Some(drops) = &self.drops
+            && let Ok(guest_path) = drops.stage(&host_path)
+        {
+            return guest_path.as_os_str().as_bytes().to_vec();
         }
 
         // Directory outside a share, or staging failed: pass through unchanged.
