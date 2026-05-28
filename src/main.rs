@@ -30,6 +30,8 @@ use objc2_virtualization::*;
 
 mod networking;
 use networking::*;
+mod drag_translate;
+use drag_translate::{DragTranslator, DropsStaging};
 const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
 const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345c34ee13031749fdfbf66fe4c3aafd949a2d98550426090e9ac645e79009c51eb0eefc984c15786570bb38";
 const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280901576;
@@ -53,10 +55,10 @@ enum LoginAction {
 use LoginAction::*;
 
 #[derive(Clone)]
-struct DirectoryShare {
-    host: PathBuf,
-    guest: PathBuf,
-    read_only: bool,
+pub(crate) struct DirectoryShare {
+    pub(crate) host: PathBuf,
+    pub(crate) guest: PathBuf,
+    pub(crate) read_only: bool,
 }
 
 impl DirectoryShare {
@@ -140,6 +142,9 @@ Options
   --help                                                    Print this help message.
   --version                                                 Print the version (commit SHA and build date).
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+  --no-drag-translate                                       Disable drag-and-drop path translation.
+                                                            By default, paths in bracketed-paste sequences are rewritten
+                                                            to valid guest paths (or auto-staged into /root/.vibe-drops/).
   --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
                                                             Defaults to read-write.
                                                             Errors if host-path does not exist.
@@ -269,6 +274,12 @@ Options
         directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
     }
 
+    // Set up the drops staging area for drag-and-drop path translation.
+    // The drops share must be registered before the VM starts (virtiofs devices are immutable post-start).
+    let drops_host = instance_dir.join("drops");
+    let drops = DropsStaging::new(drops_host, "/root/.vibe-drops".into())?;
+    directory_shares.push(drops.as_share());
+
     // Enable bash history
     login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
 
@@ -279,6 +290,8 @@ Options
     // Any user-provided login actions must come after our system ones
     login_actions.extend(args.login_actions);
 
+    let translator = DragTranslator::new(&directory_shares, Some(drops), args.drag_translate);
+
     run_vm(
         &disk_path,
         &login_actions,
@@ -286,6 +299,7 @@ Options
         prepare_network_backend,
         args.cpu_count,
         args.ram_bytes,
+        translator,
     )
 }
 
@@ -294,6 +308,7 @@ struct CliArgs {
     version: bool,
     help: bool,
     no_default_mounts: bool,
+    drag_translate: bool,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
     network_mode: NetworkMode,
@@ -313,6 +328,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut version = false;
     let mut help = false;
     let mut no_default_mounts = false;
+    let mut drag_translate = true;
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
     let mut network_mode = NetworkMode::VmnetNat;
@@ -325,6 +341,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
             Long("no-default-mounts") => no_default_mounts = true,
+            Long("no-drag-translate") => drag_translate = false,
             Long("cpus") => {
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
                 if value == 0 {
@@ -379,6 +396,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         version,
         help,
         no_default_mounts,
+        drag_translate,
         mounts,
         login_actions,
         network_mode,
@@ -626,6 +644,7 @@ fn ensure_default_image(
         prepare_network_backend,
         DEFAULT_CPU_COUNT,
         DEFAULT_RAM_BYTES,
+        DragTranslator::new(&[], None, false),
     )?;
 
     Ok(())
@@ -664,6 +683,7 @@ pub fn spawn_vm_io(
     vm_output_fd: OwnedFd,
     vm_input_fd: OwnedFd,
     resize_control_fd: OwnedFd,
+    translator: DragTranslator,
 ) -> IoContext {
     let (input_tx, input_rx): (Sender<VmInput>, Receiver<VmInput>) = mpsc::channel();
 
@@ -693,8 +713,10 @@ pub fn spawn_vm_io(
             },
         ];
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if ret <= 0 || fds[1].revents & libc::POLLIN != 0 {
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 200) };
+        if ret < 0 {
+            PollResult::Error
+        } else if fds[1].revents & libc::POLLIN != 0 {
             PollResult::Shutdown
         } else if fds[0].revents & libc::POLLIN != 0 {
             let n = unsafe { libc::read(main_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -715,19 +737,32 @@ pub fn spawn_vm_io(
         let input_tx = input_tx.clone();
         let raw_guard = raw_guard.clone();
         let wakeup_read = wakeup_read.try_clone().unwrap();
+        let mut translator = translator;
 
         move || {
             let mut buf = [0u8; 1024];
             loop {
                 match poll_with_wakeup(libc::STDIN_FILENO, wakeup_read.as_raw_fd(), &mut buf) {
                     PollResult::Shutdown | PollResult::Error => break,
-                    PollResult::Spurious => continue,
+                    PollResult::Spurious => {
+                        // Periodic tick: let translator flush any unterminated paste that timed out.
+                        let flushed = translator.process(&[]);
+                        if !flushed.is_empty() && raw_guard.lock().unwrap().is_some() {
+                            let _ = input_tx.send(VmInput::Bytes(flushed));
+                        }
+                        continue;
+                    }
                     PollResult::Ready(bytes) => {
                         // discard input if the VM hasn't booted up yielded output yet (which triggers us entering raw_mode)
                         if raw_guard.lock().unwrap().is_none() {
+                            translator.reset();
                             continue;
                         }
-                        if input_tx.send(VmInput::Bytes(bytes.to_vec())).is_err() {
+                        let translated = translator.process(bytes);
+                        if translated.is_empty() {
+                            continue;
+                        }
+                        if input_tx.send(VmInput::Bytes(translated)).is_err() {
                             break;
                         }
                     }
@@ -1082,6 +1117,7 @@ fn run_vm(
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
+    translator: DragTranslator,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
@@ -1151,6 +1187,7 @@ fn run_vm(
         we_read_from,
         we_write_to,
         we_write_resize_to,
+        translator,
     );
 
     let mut all_login_actions = vec![
