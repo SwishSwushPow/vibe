@@ -170,6 +170,8 @@ Options:
   --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
   --env NAME                                                Export host environment variable NAME inside VM.
                                                             Errors if NAME is unset or empty.
+  --mount-git                                               Mount the project's .git directory into the VM (read-write).
+                                                            By default, .git is masked with a tmpfs overlay to discourage agent access.
   --no-drag-translate                                       Disable drag-and-drop path translation.
                                                             By default, paths in bracketed-paste sequences are rewritten
                                                             to valid guest paths (or auto-staged into /root/.vibe-drops/).
@@ -313,6 +315,9 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                 // Note that this isn't secure, since the VM runs as root and could unmount this.
                 // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
                 for subfolder in [".git", INSTANCE_DIR_NAME] {
+                    if subfolder == ".git" && args.mount_git {
+                        continue;
+                    }
                     if project_root.join(subfolder).exists() {
                         login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {subfolder}")));
                     }
@@ -404,6 +409,7 @@ struct CliArgs {
     help: bool,
     no_default_mounts: bool,
     env: HashMap<String, String>,
+    mount_git: bool,
     drag_translate: bool,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
@@ -532,6 +538,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut help = false;
     let mut no_default_mounts = false;
     let mut env_vars = HashMap::new();
+    let mut mount_git = false;
     let mut drag_translate = true;
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
@@ -567,6 +574,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 );
                 env_vars.insert(name, value);
             }
+            Long("mount-git") => mount_git = true,
             Long("no-drag-translate") => drag_translate = false,
             Long("cpus") => cpu_count = parse_cpu_count(&mut parser)?,
             Long("ram") => ram_bytes = parse_ram_size(&mut parser)?,
@@ -621,6 +629,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         help,
         no_default_mounts,
         env: env_vars,
+        mount_git,
         drag_translate,
         mounts,
         login_actions,
