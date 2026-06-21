@@ -157,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
 
 vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
-vibe provision [--base name-or-path] [--image name] [--replace] [@built-in | path/to/script.sh ...]
+vibe provision [PROVISIONING_OPTIONS] [@built-in | path/to/script.sh ...]
 
 Options:
 
@@ -187,6 +187,8 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
   --base NAME_OR_PATH                                       Use this existing image or path/to/image.raw as base for new image (default Debian Stable).
   --image NAME                                              Name for new image (default `default`).
   --replace                                                 Replace existing image with NAME, if one exists.
+  --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
+  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
 
 {}",
                  provisioning_scripts_banner()
@@ -223,6 +225,8 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
             image,
             replace,
             scripts,
+            cpu_count,
+            ram_bytes,
         } => {
             let base_raw = match base {
                 Some(base) if base.contains('/') => PathBuf::from(base),
@@ -242,6 +246,8 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
                 &scripts,
                 std::slice::from_ref(&mise_directory_share),
                 prepare_network_backend,
+                cpu_count,
+                ram_bytes,
             )
         }
         CliCommand::Run { disk, image } => {
@@ -393,6 +399,8 @@ enum CliCommand {
         image: String,
         replace: bool,
         scripts: Vec<ProvisionScript>,
+        cpu_count: usize,
+        ram_bytes: u64,
     },
 }
 
@@ -403,6 +411,26 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             .map_err(|_| format!("{flag} expects valid UTF-8").into())
     }
 
+    fn parse_ram_size(
+        parser: &mut lexopt::Parser,
+    ) -> Result<u64, Box<dyn std::error::Error + 'static>> {
+        let value: u64 = os_to_string(parser.value()?, "--ram")?.parse()?;
+        if value == 0 {
+            return Err("--ram must be >= 1".into());
+        }
+        Ok(value * BYTES_PER_MB)
+    }
+
+    fn parse_cpu_count(
+        parser: &mut lexopt::Parser,
+    ) -> Result<usize, Box<dyn std::error::Error + 'static>> {
+        let value: usize = os_to_string(parser.value()?, "--cpus")?.parse()?;
+        if value == 0 {
+            return Err("--cpus must be >= 1".into());
+        }
+        Ok(value)
+    }
+
     fn parse_provision_command(
         parser: &mut lexopt::Parser,
     ) -> Result<CliCommand, Box<dyn std::error::Error>> {
@@ -411,6 +439,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         let mut image_seen = false;
         let mut replace = false;
         let mut scripts = Vec::new();
+        let mut cpu_count = DEFAULT_CPU_COUNT;
+        let mut ram_bytes = DEFAULT_RAM_BYTES;
 
         while let Some(arg) = parser.next()? {
             match arg {
@@ -429,6 +459,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                     assert_valid_image_name(&image);
                 }
                 Long("replace") => replace = true,
+                Long("cpus") => cpu_count = parse_cpu_count(parser)?,
+                Long("ram") => ram_bytes = parse_ram_size(parser)?,
                 Value(value) => {
                     let name = os_to_string(value, "provisioning script")?;
                     let script = if let Some(name) = name.strip_prefix('@') {
@@ -463,6 +495,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             image,
             replace,
             scripts,
+            cpu_count,
+            ram_bytes,
         })
     }
 
@@ -509,20 +543,8 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 );
                 env_vars.insert(name, value);
             }
-            Long("cpus") => {
-                let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
-                if value == 0 {
-                    return Err("--cpus must be >= 1".into());
-                }
-                cpu_count = value;
-            }
-            Long("ram") => {
-                let value: u64 = os_to_string(parser.value()?, "--ram")?.parse()?;
-                if value == 0 {
-                    return Err("--ram must be >= 1".into());
-                }
-                ram_bytes = value * BYTES_PER_MB;
-            }
+            Long("cpus") => cpu_count = parse_cpu_count(&mut parser)?,
+            Long("ram") => ram_bytes = parse_ram_size(&mut parser)?,
             Long("mount") => {
                 mounts.push(os_to_string(parser.value()?, "--mount")?);
             }
@@ -879,9 +901,12 @@ fn ensure_default_image(
         &default_provisioning_scripts[..],
         directory_shares,
         prepare_network_backend,
+        DEFAULT_CPU_COUNT,
+        DEFAULT_RAM_BYTES,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn provision_image(
     base_raw: &Path,
     image_raw: &Path,
@@ -889,6 +914,8 @@ fn provision_image(
     extra_scripts: &[ProvisionScript],
     directory_shares: &[DirectoryShare],
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
+    cpu_count: usize,
+    ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let image_name = image_raw
         .file_stem()
@@ -973,8 +1000,8 @@ export VIBE_PROVISION_SCRIPTS='{}'",
             &login_actions,
             directory_shares,
             prepare_network_backend,
-            DEFAULT_CPU_COUNT,
-            DEFAULT_RAM_BYTES,
+            cpu_count,
+            ram_bytes,
         )?;
 
         fs::rename(&tmp_raw, image_raw)?;

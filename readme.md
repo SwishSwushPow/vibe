@@ -114,7 +114,7 @@ If you don't want this, you can make your own `.raw` disk images and copy them i
 
 ```
 vibe [OPTIONS] [LOGIN-ACTIONS ...] [path/to/disk.raw]
-vibe provision [--base name-or-path] [--image name] [--replace] [@built-in | path/to/script.sh ...]
+vibe provision [PROVISIONING_OPTIONS] [@built-in | path/to/script.sh ...]
 
 Options:
 
@@ -144,6 +144,8 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
   --base NAME_OR_PATH                                       Use this existing image or path/to/image.raw as base for new image (default Debian Stable).
   --image NAME                                              Name for new image (default `default`).
   --replace                                                 Replace existing image with NAME, if one exists.
+  --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
+  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
 ```
 
 ## Other notes
